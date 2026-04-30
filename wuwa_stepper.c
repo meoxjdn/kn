@@ -7,28 +7,25 @@
 #include <linux/mm.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
-#include <linux/ftrace.h>
+#include <linux/kprobes.h>        // 核心改动：抛弃 Ftrace，改用 Kprobes
 #include <linux/miscdevice.h>
-#include <asm/debug-monitors.h>
-#include <asm/fpsimd.h> // 用于 Action 6 的浮点刷新
+#include <asm/debug-monitors.h>   // 包含 register_user_step_hook
 
 #include "wuwa_ctrl.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DaNiu");
-MODULE_DESCRIPTION("Universal UXN + Single Step Stealth Hook Engine");
+MODULE_DESCRIPTION("Universal UXN + Single Step Stealth Hook Engine (GKI 6.6 Edition)");
 
-// 引擎全局配置 (支持单点劫持演示)
 static struct patch_req active_req = {0};
 static bool engine_active = false;
 
 // ==========================================
-// 底层工具：操控物理页的 UXN 权限
+// 1. 底层工具：操控物理页的 UXN 权限
 // ==========================================
 static void toggle_page_uxn(struct mm_struct *mm, unsigned long addr, bool enable_uxn) {
     pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep, pte;
 
-    // 无锁页表遍历 (要求在当前进程上下文中，或者确保 mm 未被销毁)
     pgd = pgd_offset(mm, addr);
     if (pgd_none(*pgd) || pgd_bad(*pgd)) return;
     p4d = p4d_offset(pgd, addr);
@@ -47,14 +44,11 @@ static void toggle_page_uxn(struct mm_struct *mm, unsigned long addr, bool enabl
         pte = clear_pte_bit(pte, __pgprot(PTE_UXN));
     }
     set_pte(ptep, pte);
-    
-    // 强制刷新 TLB 保证立即生效
     flush_tlb_mm(mm);
 }
 
 // ==========================================
-// 业务逻辑核心：无痕操作寄存器上下文
-// 返回 true 表示成功修改了流向，不需要执行原指令；返回 false 表示需放行原指令
+// 2. 虚拟动作执行器 (寄存器魔法)
 // ==========================================
 static bool apply_virtual_action(struct pt_regs *regs, struct patch_req *req) {
     uint32_t val = 0;
@@ -69,29 +63,27 @@ static bool apply_virtual_action(struct pt_regs *regs, struct patch_req *req) {
             return true;
 
         case 3: /* Virtual God Mode */
-            // 安全读取目标进程内存 (必须关缺页异常，防止在中断上下文中睡眠)
             pagefault_disable();
             if (__get_user(val, (uint32_t __user *)(regs->regs[1] + 0x1C)) == 0) {
-                if (val == 0) { // 发现是玩家 (TeamID == 0)
-                    regs->regs[0] = 1;         // 伤害锁为 1
-                    regs->pc = regs->regs[30]; // 强行返回
+                if (val == 0) {
+                    regs->regs[0] = 1;
+                    regs->pc = regs->regs[30];
                     pagefault_enable();
                     return true;
                 }
             }
             pagefault_enable();
-            return false; // 非玩家，或者读取失败，返回 false 放行原指令
+            return false;
 
         case 5: /* Safe HP Stub */
             regs->regs[0] = 1;
             regs->pc = regs->regs[30];
             return true;
 
-        case 6: /* Float Ret */
-            // 写入浮点寄存器并强刷上下文
-            fpsimd_save(); 
+        case 6: /* Float Ret (修复 6.6 不导出 fpsimd_save 的问题) */
+            // 异常上下文中，用户态寄存器已由硬件/底层汇编妥善托管。
+            // 只要修改当前线程绑定的 state 结构体，返回用户态时内核会自动按此恢复。
             current->thread.uw.fpsimd_state.vregs[0] = (u64)req->patch_val;
-            fpsimd_flush_task_state(current); 
             regs->pc = regs->regs[30];
             return true;
 
@@ -101,78 +93,62 @@ static bool apply_virtual_action(struct pt_regs *regs, struct patch_req *req) {
 }
 
 // ==========================================
-// 异常接管钩子：do_mem_abort (拦截 UXN)
+// 3. 核心大招：Kprobes 接管 do_mem_abort 并 Bypass
 // ==========================================
-typedef int (*do_mem_abort_t)(unsigned long addr, unsigned int esr, struct pt_regs *regs);
-static do_mem_abort_t orig_do_mem_abort;
+static int hook_do_mem_abort_pre(struct kprobe *p, struct pt_regs *regs) {
+    // ARM64 do_mem_abort(addr, esr, uregs) 对应寄存器 x0, x1, x2
+    unsigned long addr = regs->regs[0];
+    unsigned long esr = regs->regs[1];
+    struct pt_regs *uregs = (struct pt_regs *)regs->regs[2];
 
-static int notrace hook_do_mem_abort(unsigned long addr, unsigned int esr, struct pt_regs *regs) {
     unsigned int ec = esr >> 26;
 
-    // 识别目标进程的 Instruction Abort (EL0)
     if (engine_active && current->pid == active_req.pid && ec == 0x20) {
         unsigned long page_base = active_req.va & PAGE_MASK;
         
         if ((addr & PAGE_MASK) == page_base) {
-            // 1. 精准踩中 Hook 点！
-            if (regs->pc == active_req.va) {
-                if (apply_virtual_action(regs, &active_req)) {
-                    // Action 成功接管控制流，吃掉异常，直接按照新 PC 飞走
-                    return 0; 
+            
+            // 踩中精准 Hook 点，执行 Action
+            if (uregs->pc == active_req.va) {
+                if (apply_virtual_action(uregs, &active_req)) {
+                    // Action 成功，需要吃掉这个异常。
+                    // 魔法：修改 PC 指向 LR（返回地址），返回 1 通知 Kprobe 取消原函数单步！
+                    regs->pc = regs->regs[30]; 
+                    return 1; 
                 }
             }
 
-            // 2. 未踩中，或 Action(如GodMode判断为怪物)要求放行执行原始逻辑
-            // 开启硬件单步死循环
-            toggle_page_uxn(current->mm, page_base, false); // 开门
-            user_enable_single_step(current);               // 挂绳子
-            return 0; // ERET: CPU 将原生执行那一条原始指令
+            // 未踩中，开启硬件单步
+            toggle_page_uxn(current->mm, page_base, false);
+            user_enable_single_step(current);
+            
+            // 同样需要吃掉异常，防止原版 do_mem_abort 杀掉游戏进程
+            regs->pc = regs->regs[30];
+            return 1; 
         }
     }
-    return orig_do_mem_abort(addr, esr, regs);
+    
+    // 如果不是我们的目标进程或异常类型，返回 0 乖乖让 Kprobe 放行原函数
+    return 0; 
 }
 
-// Ftrace 注册脚手架
-struct ftrace_hook {
-    const char *name;
-    void *function;
-    void *original;
-    unsigned long address;
-    struct ftrace_ops ops;
-};
-
-static int resolve_hook_address(struct ftrace_hook *hook) {
-    hook->address = kallsyms_lookup_name(hook->name);
-    if (!hook->address) return -ENOENT;
-    *((unsigned long*) hook->original) = hook->address + MCOUNT_INSN_SIZE;
-    return 0;
-}
-
-static void notrace ftrace_thunk(unsigned long ip, unsigned long parent_ip,
-                                 struct ftrace_ops *ops, struct ftrace_regs *fregs) {
-    struct pt_regs *regs = ftrace_get_regs(fregs);
-    struct ftrace_hook *hook = container_of(ops, struct ftrace_hook, ops);
-    if (regs) regs->pc = (unsigned long)hook->function;
-}
-
-static struct ftrace_hook mem_abort_hook = {
-    .name = "do_mem_abort",
-    .function = hook_do_mem_abort,
-    .original = &orig_do_mem_abort,
+static struct kprobe mem_abort_kp = {
+    .symbol_name = "do_mem_abort",
+    .pre_handler = hook_do_mem_abort_pre,
 };
 
 // ==========================================
-// 硬件单步回调钩子：回收权限
+// 4. 单步回收：适配 Android 15 新版 API
+// 注意修复了 esr 参数类型为 unsigned long
 // ==========================================
-static int wuwa_step_handler(struct pt_regs *regs, unsigned int esr) {
+static int wuwa_step_handler(struct pt_regs *regs, unsigned long esr) {
     if (engine_active && current->pid == active_req.pid) {
         unsigned long page_base = active_req.va & PAGE_MASK;
         
-        // 执行完一条指令了，立刻关门
-        user_disable_single_step(current);            // 解开绳子
-        toggle_page_uxn(current->mm, page_base, true); // 锁门，重新打上 UXN
+        user_disable_single_step(current);
+        toggle_page_uxn(current->mm, page_base, true);
         
-        return 0; // 成功消化单步异常，游戏将继续跑，马上又会触发 UXN
+        return 0; // DBG_HOOK_HANDLED
     }
     return DBG_HOOK_ERROR;
 }
@@ -182,7 +158,7 @@ static struct step_hook my_step_hook = {
 };
 
 // ==========================================
-// 控制接口与设备注册
+// 控制接口与注册
 // ==========================================
 static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     struct patch_req req;
@@ -193,7 +169,6 @@ static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
 
         if (req.enabled == 0) {
             engine_active = false;
-            // 清理遗留的 UXN
             task = pid_task(find_vpid(active_req.pid), PIDTYPE_PID);
             if (task && task->mm) {
                 toggle_page_uxn(task->mm, active_req.va & PAGE_MASK, false);
@@ -205,11 +180,9 @@ static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
         task = pid_task(find_vpid(req.pid), PIDTYPE_PID);
         if (!task || !task->mm) return -ESRCH;
 
-        // 保存全局状态
         active_req = req;
         engine_active = true;
 
-        // 首次激活：给目标页挂上 UXN
         toggle_page_uxn(task->mm, active_req.va & PAGE_MASK, true);
         pr_info("[wuwa] 引擎激活！精准截击设定完毕: 0x%llx\n", active_req.va);
         return 0;
@@ -231,36 +204,34 @@ static struct miscdevice wuwa_misc_device = {
     .fops = &wuwa_fops,
 };
 
-// ==========================================
-// 模块出入口
-// ==========================================
 static int __init wuwa_engine_init(void) {
     int err;
     
-    // 1. 注册设备节点
     if ((err = misc_register(&wuwa_misc_device))) return err;
 
-    // 2. 注册硬件单步调试器回调
-    register_step_hook(&my_step_hook);
+    // 核心修复：使用 register_user_step_hook
+    register_user_step_hook(&my_step_hook);
 
-    // 3. 拦截内核指令异常总入口
-    if (resolve_hook_address(&mem_abort_hook) == 0) {
-        mem_abort_hook.ops.func = ftrace_thunk;
-        mem_abort_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
-        ftrace_set_filter_ip(&mem_abort_hook.ops, mem_abort_hook.address, 0, 0);
-        register_ftrace_function(&mem_abort_hook.ops);
+    // 核心修复：注册 Kprobe
+    if ((err = register_kprobe(&mem_abort_kp)) < 0) {
+        pr_err("[wuwa] Kprobe 注册失败: %d\n", err);
+        unregister_user_step_hook(&my_step_hook);
+        misc_deregister(&wuwa_misc_device);
+        return err;
     }
 
-    pr_info("[wuwa_stepper] 终极无痕硬件劫持引擎初始化成功！\n");
+    pr_info("[wuwa_stepper] 终极无痕硬件劫持引擎初始化成功 (Android 15 Kprobe 版)！\n");
     return 0;
 }
 
 static void __exit wuwa_engine_exit(void) {
     engine_active = false;
-    unregister_ftrace_function(&mem_abort_hook.ops);
-    ftrace_set_filter_ip(&mem_abort_hook.ops, mem_abort_hook.address, 1, 0);
-    unregister_step_hook(&my_step_hook);
+    
+    // 清理资源
+    unregister_kprobe(&mem_abort_kp);
+    unregister_user_step_hook(&my_step_hook);
     misc_deregister(&wuwa_misc_device);
+    
     pr_info("[wuwa_stepper] 引擎已彻底卸载。\n");
 }
 
