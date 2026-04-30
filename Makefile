@@ -1,12 +1,14 @@
-# 纯净版内核模块 Makefile (专为 GitHub Actions DDK 适配)
-obj-m += wuwa_stepper.o
+# 最终修正版 Makefile - 确保输出文件名与 Actions 匹配
+MODULE_NAME := android-wuwa
+
+# 核心逻辑：将 wuwa_stepper.o 链接为 android-wuwa.ko
+obj-m += $(MODULE_NAME).o
+$(MODULE_NAME)-y := wuwa_stepper.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
-all: driver
-
-driver:
+all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 clean:
