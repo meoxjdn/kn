@@ -22,11 +22,10 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DaNiu");
-MODULE_DESCRIPTION("GKI Traceiter Multi-Slot Engine (Safe X3 & 6.6 Compile Fix)");
+MODULE_DESCRIPTION("GKI Traceiter Multi-Slot Engine (Diagnostic Probe Edition)");
 
 #define MAX_HOOKS 16
 
-// ====== 动态符号解析 ======
 typedef void (*fn_register_user_step_hook)(struct step_hook *hook);
 typedef void (*fn_unregister_user_step_hook)(struct step_hook *hook);
 typedef void (*fn_user_enable_single_step)(struct task_struct *task);
@@ -59,13 +58,11 @@ static int resolve_all_symbols(void) {
     return 0;
 }
 
-// ====== 多槽位状态机与安全锁 ======
 static struct patch_req active_reqs[MAX_HOOKS];
 static atomic_t engine_active = ATOMIC_INIT(0);
 static atomic_t in_flight_handlers = ATOMIC_INIT(0);
 DEFINE_SEQLOCK(req_seqlock);
 
-// ====== 跨版本强制物理页驻留 (修复 6.5+ 编译错误) ======
 static int force_page_resident(struct task_struct *task, unsigned long addr) {
     struct mm_struct *mm = get_task_mm(task);
     struct page *page = NULL;
@@ -74,7 +71,6 @@ static int force_page_resident(struct task_struct *task, unsigned long addr) {
     if (!mm) return -ESRCH;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
-    // 6.5 之后移除了 vmas 参数
     mmap_read_lock(mm);
     ret = get_user_pages_remote(mm, addr, 1, FOLL_FORCE, &page, NULL);
     mmap_read_unlock(mm);
@@ -98,7 +94,6 @@ static int force_page_resident(struct task_struct *task, unsigned long addr) {
     return ret;
 }
 
-// ====== Lockless PTE 原子修改 (修复 CONT 避让) ======
 static void toggle_page_uxn_lockless(struct mm_struct *mm, unsigned long addr, bool enable_uxn) {
     pgd_t *pgdp; p4d_t *p4dp; pud_t *pudp; pmd_t *pmdp; pte_t *ptep;
     pmd_t pmd_val; pte_t old_pte, new_pte;
@@ -120,12 +115,7 @@ static void toggle_page_uxn_lockless(struct mm_struct *mm, unsigned long addr, b
         old_pte = READ_ONCE(*ptep);
         
         if (!pte_present(old_pte)) return; 
-        
-        // 遇到连续页表项直接跑路，绝不强行 clear_pte_bit 造成系统崩溃
-        if (pte_cont(old_pte)) {
-            pr_warn("[wuwa] CONT_PTE detected at 0x%lx, safely skipped.\n", addr);
-            return; 
-        }
+        if (pte_cont(old_pte)) return; 
         
         if (enable_uxn && (pte_val(old_pte) & PTE_UXN)) return;
         if (!enable_uxn && !(pte_val(old_pte) & PTE_UXN)) return;
@@ -133,17 +123,14 @@ static void toggle_page_uxn_lockless(struct mm_struct *mm, unsigned long addr, b
         new_pte = enable_uxn ? set_pte_bit(old_pte, __pgprot(PTE_UXN)) : clear_pte_bit(old_pte, __pgprot(PTE_UXN));
     } while (cmpxchg((u64 *)ptep, pte_val(old_pte), pte_val(new_pte)) != pte_val(old_pte));
 
-    // 精准 ASID TLB 刷新
     ttbr0 = read_sysreg(ttbr0_el1);
     asid = (ttbr0 & GENMASK_ULL(63, 48)) >> 48;
     tlbi_val = (asid << 48) | (addr >> 12);
-    
     dsb(ishst);
     __asm__ volatile("tlbi vale1is, %0" : : "r" (tlbi_val));
     dsb(ish); isb();
 }
 
-// ====== 虚拟动作引擎 ======
 static bool apply_virtual_action(struct pt_regs *regs, struct patch_req *req) {
     uint32_t val = 0;
     switch (req->action) {
@@ -151,12 +138,8 @@ static bool apply_virtual_action(struct pt_regs *regs, struct patch_req *req) {
             if (req->patch_val == 0xD65F03C0) regs->pc = regs->regs[30];
             else regs->pc += 4;
             return true;
-        case 1: 
-            regs->pc = regs->regs[30]; 
-            return true;
-        case 2: 
-            regs->pc = req->target_va; 
-            return true;
+        case 1: regs->pc = regs->regs[30]; return true;
+        case 2: regs->pc = req->target_va; return true;
         case 3:
             if (regs->regs[1] == 0) return false;
             pagefault_disable();
@@ -165,22 +148,13 @@ static bool apply_virtual_action(struct pt_regs *regs, struct patch_req *req) {
             }
             pagefault_enable(); 
             return false;
-        case 4: 
-            regs->pc += 8;
-            return true;
-        case 5: 
-            regs->regs[0] = 1; regs->pc = regs->regs[30]; 
-            return true;
-        case 6: 
-            current->thread.uw.fpsimd_state.vregs[0] = (u64)req->patch_val;
-            regs->pc = regs->regs[30]; 
-            return true;
-        default: 
-            return false;
+        case 4: regs->pc += 8; return true;
+        case 5: regs->regs[0] = 1; regs->pc = regs->regs[30]; return true;
+        case 6: current->thread.uw.fpsimd_state.vregs[0] = (u64)req->patch_val; regs->pc = regs->regs[30]; return true;
+        default: return false;
     }
 }
 
-// ====== 核心拦截点：Traceiter 安全识别 ======
 static int hook_trace_pre(struct kprobe *p, struct pt_regs *kregs) {
     struct pt_regs *uregs = NULL;
     unsigned int seq;
@@ -190,24 +164,33 @@ static int hook_trace_pre(struct kprobe *p, struct pt_regs *kregs) {
 
     if (atomic_read(&engine_active) == 0) return 0;
 
-    // 直接取 x3，绝不瞎猜，绝不强行解引用 user_mode
+    // 【强力侦测日志】只要引擎激活，进来就无脑打印
+    pr_info("[wuwa] trace hit: sym=%s pid=%d x1=%llx x2=%llx x3=%llx x4=%llx\n",
+            p->symbol_name,
+            current->pid,
+            kregs->regs[1],
+            kregs->regs[2],
+            kregs->regs[3],
+            kregs->regs[4]);
+
+    // 取 x3 并做非空、内核地址校验 (不强转解引用)
     uregs = (struct pt_regs *)kregs->regs[3];
     if (!uregs) return 0;
     if ((unsigned long)uregs < 0xffffff0000000000ULL) return 0;
 
     atomic_inc(&in_flight_handlers);
     
-    // 多槽位快照
     do {
         if (retries++ > 3) goto out_pass;
         seq = read_seqbegin(&req_seqlock);
         memcpy(local_reqs, active_reqs, sizeof(active_reqs));
     } while (read_seqretry(&req_seqlock, seq));
 
-    // 多槽位匹配逻辑
     for (i = 0; i < MAX_HOOKS; i++) {
         if (local_reqs[i].enabled && current->pid == local_reqs[i].pid) {
             unsigned long page_base = local_reqs[i].va & PAGE_MASK;
+            // 尝试读取 user pc，如果炸了那说明 x3 的结构不是 pt_regs
+            // 但有上方的高位地址校验，通常不会死机
             if ((uregs->pc & PAGE_MASK) == page_base) {
                 page_matched = true;
                 if (uregs->pc == local_reqs[i].va) {
@@ -230,7 +213,6 @@ out_pass:
     return 0; 
 }
 
-// 挂载两个被证明可用的侧门
 static struct kprobe kp_sp_pc = {
     .symbol_name = "__traceiter_android_rvh_do_sp_pc_abort",
     .pre_handler = hook_trace_pre,
@@ -241,7 +223,6 @@ static struct kprobe kp_read_fault = {
     .pre_handler = hook_trace_pre,
 };
 
-// ====== 硬件单步回调 ======
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
 static int wuwa_step_handler(struct pt_regs *regs, unsigned int esr)
 #else
@@ -249,8 +230,7 @@ static int wuwa_step_handler(struct pt_regs *regs, unsigned long esr)
 #endif
 {
     unsigned int seq;
-    int retries = 0;
-    int i;
+    int retries = 0, i;
     struct patch_req local_reqs[MAX_HOOKS];
 
     if (atomic_read(&engine_active) == 0) return DBG_HOOK_ERROR;
@@ -265,8 +245,6 @@ static int wuwa_step_handler(struct pt_regs *regs, unsigned long esr)
 
     rcu_read_lock();
     _user_disable_single_step(current); 
-    
-    // 把该 PID 下所有激活的页全部重新打上 UXN
     for (i = 0; i < MAX_HOOKS; i++) {
         if (local_reqs[i].enabled && current->pid == local_reqs[i].pid) {
             toggle_page_uxn_lockless(current->mm, local_reqs[i].va & PAGE_MASK, true);
@@ -284,7 +262,6 @@ out_err:
 
 static struct step_hook my_step_hook = { .fn = wuwa_step_handler };
 
-// ====== 多槽位 IOCTL 通信 ======
 static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     struct patch_req req;
     struct task_struct *task;
@@ -357,7 +334,6 @@ static struct miscdevice wuwa_misc_device = {
     .minor=MISC_DYNAMIC_MINOR, .name="wuwa_stepper", .fops=&wuwa_fops 
 };
 
-// ====== 初始化与卸载 ======
 static int __init wuwa_init(void) {
     int kp_count = 0;
     if (resolve_all_symbols() < 0) return -EINVAL;
