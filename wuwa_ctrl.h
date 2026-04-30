@@ -5,13 +5,13 @@
 #include <linux/ioctl.h>
 
 struct patch_req {
-    __u32 action;       // 动作类型 (0~6)
-    __u32 pid;          // 目标 PID
-    __u64 va;           // 触发 Hook 的精准虚拟地址 (PC)
-    __u64 target_va;    // Action 2 使用的跳转目标
-    __u32 patch_val;    // Action 0/4/6 的机器码或浮点数据
-    __u32 patch_val_2;  // Action 4 的第二条机器码
-    __u32 enabled;      // 1 开启, 0 关闭
+    __u32 action;       // 功能 ID (1:去黑边, 2:跳过, 3:无敌, 4:双修, 5:锁血, 6:全屏)
+    __u32 pid;          // 目标进程 PID
+    __u64 va;           // 目标虚拟地址 (精确到指令)
+    __u64 target_va;    // Action 2 专用的跳转目标
+    __u32 patch_val;    // 附加数据 1 (机器码或浮点)
+    __u32 patch_val_2;  // 附加数据 2 (Action 4)
+    __u32 enabled;      // 1 开启，0 关闭
 };
 
 #define WUWA_MAGIC 'W'
