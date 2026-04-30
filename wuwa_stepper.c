@@ -34,17 +34,48 @@ static fn_user_enable_single_step _user_enable_single_step;
 static fn_user_disable_single_step _user_disable_single_step;
 
 // 接收外部传入的地址参数
-static unsigned long addr_reg_step = 0;
-static unsigned long addr_unreg_step = 0;
-static unsigned long addr_en_step = 0;
-static unsigned long addr_dis_step = 0;
+static char *addr_reg_step = NULL;
+static char *addr_unreg_step = NULL;
+static char *addr_en_step = NULL;
+static char *addr_dis_step = NULL;
 
-module_param(addr_reg_step, ulong, 0444);
-module_param(addr_unreg_step, ulong, 0444);
-module_param(addr_en_step, ulong, 0444);
-module_param(addr_dis_step, ulong, 0444);
+module_param(addr_reg_step, charp, 0444);
+module_param(addr_unreg_step, charp, 0444);
+module_param(addr_en_step, charp, 0444);
+module_param(addr_dis_step, charp, 0444);
 
 static int resolve_all_symbols(void) {
+    unsigned long reg = 0, unreg = 0, en = 0, dis = 0;
+
+    pr_err("[wuwa] raw params: reg=%s unreg=%s en=%s dis=%s\n",
+           addr_reg_step ? addr_reg_step : "NULL",
+           addr_unreg_step ? addr_unreg_step : "NULL",
+           addr_en_step ? addr_en_step : "NULL",
+           addr_dis_step ? addr_dis_step : "NULL");
+
+    if (!addr_reg_step || !addr_unreg_step || !addr_en_step || !addr_dis_step) {
+        pr_err("[wuwa] 缺少外部传入的符号地址字符串！\n");
+        return -EINVAL;
+    }
+
+    if (kstrtoul(addr_reg_step, 0, &reg) ||
+        kstrtoul(addr_unreg_step, 0, &unreg) ||
+        kstrtoul(addr_en_step, 0, &en) ||
+        kstrtoul(addr_dis_step, 0, &dis)) {
+        pr_err("[wuwa] 符号地址字符串解析失败！\n");
+        return -EINVAL;
+    }
+
+    _register_user_step_hook = (fn_register_user_step_hook)reg;
+    _unregister_user_step_hook = (fn_unregister_user_step_hook)unreg;
+    _user_enable_single_step = (fn_user_enable_single_step)en;
+    _user_disable_single_step = (fn_user_disable_single_step)dis;
+
+    pr_err("[wuwa] syms ok: reg=%lx unreg=%lx en=%lx dis=%lx\n",
+           reg, unreg, en, dis);
+
+    return 0;
+}
     if (!addr_reg_step || !addr_unreg_step || !addr_en_step || !addr_dis_step) {
         pr_err("[wuwa] 缺少外部传入的符号地址！\n");
         return -EINVAL;
