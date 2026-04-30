@@ -121,34 +121,76 @@ static void toggle_page_uxn_lockless(struct mm_struct *mm, unsigned long addr, b
     isb();
 }
 
-// ====== 寄存器虚拟动作 ======
+// ====== 寄存器虚拟动作核心分发器 ======
 static bool apply_virtual_action(struct pt_regs *regs, struct patch_req *req) {
     uint32_t val = 0;
+
     switch (req->action) {
-        case 1: 
-            regs->pc = regs->regs[30]; return true;
-        case 2: 
-            regs->pc = req->target_va; return true;
-        case 3:
+        case 0: /* SHADOW_DATA_PATCH (虚拟 NOP 化) */
+            // 物理引擎是写入机器码，虚拟引擎我们不写内存。
+            // 绝大多数 Data Patch 的目的都是屏蔽某条指令，所以我们直接跳过它。
+            // 如果你传入的是 RET (0xD65F03C0)，直接虚拟返回。
+            if (req->patch_val == 0xD65F03C0) {
+                regs->pc = regs->regs[30];
+            } else {
+                regs->pc += 4; // 相当于 Virtual NOP
+            }
+            return true;
+
+        case 1: /* SHADOW_RET_ONLY */
+            regs->pc = regs->regs[30]; 
+            return true;
+
+        case 2: /* SHADOW_JUMP_B (秒过) */
+            // 再也没有 134217728LL 的边界限制了！想跳哪就跳哪。
+            regs->pc = req->target_va;
+            return true;
+
+        case 3: /* 彻底 1:1 复刻的 God Mode (无 Cave 版) */
+            // 完美对应旧版的: CBZ X1, orig
+            if (regs->regs[1] == 0) return false; // X1 为空，返回 false 让 CPU 正常执行原指令
+
             pagefault_disable();
+            // 完美对应旧版的: LDR W16, [X1, #0x1C]
             if (__get_user(val, (uint32_t __user *)(regs->regs[1] + 0x1C)) == 0) {
-                if (val == 0) {
+                // 完美对应旧版的: CBNZ W16, orig
+                if (val == 0) { 
+                    // 完美对应旧版的: MOV W0, #1
                     regs->regs[0] = 1; 
+                    // 完美对应旧版的: RET
                     regs->pc = regs->regs[30]; 
-                    pagefault_enable(); return true;
+                    pagefault_enable();
+                    return true; // 劫持成功，虚拟返回
                 }
             }
-            pagefault_enable(); return false;
-        case 5: 
-            regs->regs[0] = 1; regs->pc = regs->regs[30]; return true;
-        case 6: 
+            pagefault_enable();
+            
+            // 不是玩家，或者读取失败，返回 false
+            // CPU 会在单步回调里老老实实执行 orig_ins 原指令！
+            return false; 
+
+        case 4: /* SHADOW_DOUBLE_PATCH (去黑边双指令) */
+            // 相当于直接跳过 2 条指令 (Virtual Double NOP)
+            regs->pc += 8;
+            return true;
+
+        case 5: /* SHADOW_SAFE_HP_STUB (秒杀蹦床) */
+            // 不用找 0xF00 写 Trampoline 了
+            regs->regs[0] = 1;         // MOV W0, #1
+            regs->pc = regs->regs[30]; // RET
+            return true;
+
+        case 6: /* SHADOW_FLOAT_RET (全屏浮点) */
+            // 直接改线程绑定的浮点寄存器
             current->thread.uw.fpsimd_state.vregs[0] = (u64)req->patch_val;
             regs->pc = regs->regs[30]; 
             return true;
+
         default: 
             return false;
     }
 }
+
 
 // ====== 黑科技：基于特征匹配的 Traceiter 旁路劫持 ======
 static int hook_trace_pre(struct kprobe *p, struct pt_regs *kregs) {
