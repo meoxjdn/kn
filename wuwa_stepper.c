@@ -343,8 +343,12 @@ static int __init wuwa_engine_init(void) {
         return -ENOSYS;
     }
     if ((err = misc_register(&wuwa_misc_device))) return err;
-    _register_user_step_hook(&my_step_hook);
-    if ((err = register_kprobe(&mem_abort_kp)) < 0) {
+    pr_err("[wuwa] before register_user_step_hook\n");
+_register_user_step_hook(&my_step_hook);
+pr_err("[wuwa] after register_user_step_hook\n");
+    pr_err("[wuwa] before register_kprobe do_mem_abort\n");
+if ((err = register_kprobe(&mem_abort_kp)) < 0) {
+    pr_err("[wuwa] register_kprobe do_mem_abort failed err=%d\n", err);
         _unregister_user_step_hook(&my_step_hook);
         misc_deregister(&wuwa_misc_device);
         return err;
