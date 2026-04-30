@@ -22,7 +22,7 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DaNiu");
 MODULE_DESCRIPTION("GKI 6.6 Ultimate Stealth Engine (Final Pragmatic Edition)");
 
-// ====== 动态符号偷取 ======
+// ====== 动态符号表 (外部参数注入版) ======
 typedef void (*fn_register_user_step_hook)(struct step_hook *hook);
 typedef void (*fn_unregister_user_step_hook)(struct step_hook *hook);
 typedef void (*fn_user_enable_single_step)(struct task_struct *task);
@@ -33,24 +33,28 @@ static fn_unregister_user_step_hook _unregister_user_step_hook;
 static fn_user_enable_single_step _user_enable_single_step;
 static fn_user_disable_single_step _user_disable_single_step;
 
-static void *find_hidden_symbol(const char *name) {
-    struct kprobe kp = { .symbol_name = name };
-    void *addr;
-    if (register_kprobe(&kp) < 0) return NULL;
-    addr = (void *)kp.addr;
-    unregister_kprobe(&kp);
-    return addr;
-}
+// 接收外部传入的地址参数
+static unsigned long addr_reg_step = 0;
+static unsigned long addr_unreg_step = 0;
+static unsigned long addr_en_step = 0;
+static unsigned long addr_dis_step = 0;
+
+module_param(addr_reg_step, ulong, 0444);
+module_param(addr_unreg_step, ulong, 0444);
+module_param(addr_en_step, ulong, 0444);
+module_param(addr_dis_step, ulong, 0444);
 
 static int resolve_all_symbols(void) {
-    _register_user_step_hook = (fn_register_user_step_hook)find_hidden_symbol("register_user_step_hook");
-    _unregister_user_step_hook = (fn_unregister_user_step_hook)find_hidden_symbol("unregister_user_step_hook");
-    _user_enable_single_step = (fn_user_enable_single_step)find_hidden_symbol("user_enable_single_step");
-    _user_disable_single_step = (fn_user_disable_single_step)find_hidden_symbol("user_disable_single_step");
-
-    if (!_register_user_step_hook || !_user_enable_single_step || !_user_disable_single_step || !_unregister_user_step_hook) {
-        return -ENOENT;
+    if (!addr_reg_step || !addr_unreg_step || !addr_en_step || !addr_dis_step) {
+        pr_err("[wuwa] 缺少外部传入的符号地址！\n");
+        return -EINVAL;
     }
+
+    _register_user_step_hook = (fn_register_user_step_hook)addr_reg_step;
+    _unregister_user_step_hook = (fn_unregister_user_step_hook)addr_unreg_step;
+    _user_enable_single_step = (fn_user_enable_single_step)addr_en_step;
+    _user_disable_single_step = (fn_user_disable_single_step)addr_dis_step;
+
     return 0;
 }
 
