@@ -22,7 +22,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DaNiu");
-MODULE_DESCRIPTION("Page-Centric Shadow Manager (Transactional & Strict Lifecycle)");
+MODULE_DESCRIPTION("Page-Centric Shadow Manager (Strict Semantics & No Compromise)");
 
 #define ARM64_PTE_PFN_MASK GENMASK_ULL(47, 12)
 #define MAX_PATCHES_PER_PAGE 8
@@ -37,6 +37,7 @@ struct shadow_page {
     
     int cave_watermark;
     int patch_count;
+    bool corrupted; 
     struct patch_req patches[MAX_PATCHES_PER_PAGE];
 };
 
@@ -77,31 +78,36 @@ static int alloc_cave_in_page(void *kaddr, struct shadow_page *sp, int size) {
             count = 0;
         }
     }
-    return -1; 
+    return -ENOSPC; 
 }
 
-// ====== 注入单个 Patch ======
+// ====== 注入单个 Patch (严格 C99 修复) ======
 static int apply_single_patch(struct shadow_page *sp, struct patch_req *req, void *sh_kaddr) {
     unsigned long off = req->va & ~PAGE_MASK;
     uint32_t *dst = (uint32_t *)((char *)sh_kaddr + off);
+    
+    // 【修复】所有局部变量置于块首，杜绝 C99 编译报错
+    long j_off, j_back, j_go;
+    int cave_off;
+    uint32_t *stub;
+    unsigned long cave, god;
 
     switch (req->action) {
         case 1: 
             *dst = 0xD65F03C0; 
             break;
-        case 2: {
-            long j_off = (long)req->target_va - (long)req->va;
+        case 2: 
+            j_off = (long)req->target_va - (long)req->va;
             if ((j_off < -134217728LL) || (j_off > 134217724LL)) return -ERANGE;
             *dst = 0x14000000 | ((j_off >> 2) & 0x03FFFFFF);
             break;
-        }
-        case 3: {
-            int cave_off = alloc_cave_in_page(sh_kaddr, sp, 28);
+        case 3: 
+            cave_off = alloc_cave_in_page(sh_kaddr, sp, 28);
             if (cave_off < 0) return -ENOSPC;
 
-            uint32_t *stub = (uint32_t *)((char *)sh_kaddr + cave_off);
-            unsigned long cave = (req->va & PAGE_MASK) + cave_off; 
-            unsigned long god = req->va;
+            stub = (uint32_t *)((char *)sh_kaddr + cave_off);
+            cave = (sp->va_page) + cave_off; 
+            god = req->va;
 
             stub[0] = 0xB40000A1;     
             stub[1] = 0xB9401C30;     
@@ -110,13 +116,12 @@ static int apply_single_patch(struct shadow_page *sp, struct patch_req *req, voi
             stub[4] = 0xD65F03C0;     
             stub[5] = *dst;           
 
-            long j_back = (god + 4) - (cave + 24);
+            j_back = (god + 4) - (cave + 24);
             stub[6] = 0x14000000 | ((j_back >> 2) & 0x03FFFFFF);
 
-            long j_go = cave - god;
+            j_go = cave - god;
             *dst = 0x14000000 | ((j_go >> 2) & 0x03FFFFFF);
             break;
-        }
         case 4: 
             *dst = req->patch_val;
             *(dst + 1) = req->patch_val_2;
@@ -138,38 +143,41 @@ static int apply_single_patch(struct shadow_page *sp, struct patch_req *req, voi
     return 0;
 }
 
-// ====== 影子页重构引擎 (全额重放) ======
+// ====== 影子页重构引擎 ======
 static int rebuild_shadow_page(struct shadow_page *sp) {
     void *orig_kaddr = kmap(sp->orig_page);
     void *sh_kaddr = kmap(sp->sh_page);
     int i, ret = 0;
 
-    // 快照还原
     memcpy(sh_kaddr, orig_kaddr, PAGE_SIZE);
     sp->cave_watermark = PAGE_SIZE;
 
-    // 增量重放
     for (i = 0; i < sp->patch_count; i++) {
         if ((ret = apply_single_patch(sp, &sp->patches[i], sh_kaddr)) < 0) {
             pr_err("[wuwa] 重放 Patch 失败 (VA:0x%llx), ret=%d\n", sp->patches[i].va, ret);
-            break; // 立即中断重放
+            break; 
         }
     }
 
-    // 刷入 I-Cache (确保对 ARM64 指令流水线可见)
+    // 刷入 I-Cache，确保物理页执行流可见
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
     flush_icache_range((unsigned long)sh_kaddr, (unsigned long)sh_kaddr + PAGE_SIZE);
+#else
+    __flush_icache_range((unsigned long)sh_kaddr, (unsigned long)sh_kaddr + PAGE_SIZE);
+#endif
 
     kunmap(sp->sh_page);
     kunmap(sp->orig_page);
     return ret;
 }
 
-// ====== 标准页表置换 (严格生命周期保护) ======
+// ====== 完美的 PTE 置换 (位运算保留全量语义 + 错误码细分) ======
 static int swap_pte_with_lock(struct mm_struct *mm, unsigned long addr, unsigned long target_pfn, unsigned long *out_old_pfn) {
     pgd_t *pgdp; p4d_t *p4dp; pud_t *pudp; pmd_t *pmdp; pte_t *ptep;
     pte_t pte, new_pte;
     spinlock_t *ptl;
     struct vm_area_struct *vma;
+    int ret = -EFAULT;
 
     mmap_read_lock(mm);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
@@ -178,10 +186,10 @@ static int swap_pte_with_lock(struct mm_struct *mm, unsigned long addr, unsigned
     vma = find_vma(mm, addr);
 #endif
 
+    // 【修复】：精细化错误码
     if (!vma || vma->vm_start > addr || !(vma->vm_flags & VM_EXEC)) {
-        pr_err("[wuwa] 拦截失败: VA 0x%lx 不在合法的可执行 VMA 范围内\n", addr);
-        mmap_read_unlock(mm);
-        return -EFAULT;
+        ret = -EPERM;
+        goto err_unlock;
     }
 
     pgdp = pgd_offset(mm, addr);
@@ -198,35 +206,38 @@ static int swap_pte_with_lock(struct mm_struct *mm, unsigned long addr, unsigned
 
     pte = *ptep;
     if (!pte_present(pte)) {
-        pte_unmap_unlock(ptep, ptl);
-        goto err_unlock;
+        ret = -EFAULT;
+        goto err_ptl;
     }
 
     if (pte_cont(pte)) {
-        pr_warn("[wuwa] 拦截避让: VA 0x%lx 属于 CONT_PTE, 跳过修改防崩。\n", addr);
-        pte_unmap_unlock(ptep, ptl);
-        goto err_unlock;
+        ret = -EBUSY;
+        goto err_ptl;
     }
 
     if (out_old_pfn) *out_old_pfn = pte_pfn(pte);
 
-    // 位运算替换 PFN，100% 继承 Young/Dirty/Soft-dirty 等状态位
+    // 【核心回归】：完美位运算，绝不破坏任何 Young/Dirty/Arch 语义位！
     new_pte = __pte((pte_val(pte) & ~ARM64_PTE_PFN_MASK) | (target_pfn << 12));
-    set_pte_at(mm, addr, ptep, new_pte);
     
-    // 【关键修复】: 刷新 TLB 必须在 VMA 解锁前，保证生命周期合法
+    // 拿了 PTL 锁，直接安全 WRITE_ONCE 替换，规避 6.6 set_pte_at 的各种未导出宏陷阱
+    WRITE_ONCE(*ptep, new_pte);
+    
+    // 安全时序下的 TLB 刷新
     flush_tlb_page(vma, addr);
 
     pte_unmap_unlock(ptep, ptl);
     mmap_read_unlock(mm);
     return 0;
 
+err_ptl:
+    pte_unmap_unlock(ptep, ptl);
 err_unlock:
     mmap_read_unlock(mm);
-    return -EFAULT;
+    return ret;
 }
 
-// ====== IOCTL 核心调度 (事务性回滚) ======
+// ====== IOCTL 核心调度 (闭环事务) ======
 static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     struct patch_req req;
     struct task_struct *task;
@@ -236,7 +247,6 @@ static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     long ret = 0;
     bool is_new_sp = false;
     
-    // 事务状态快照
     int old_count = 0;
     struct patch_req old_patches[MAX_PATCHES_PER_PAGE];
 
@@ -261,6 +271,10 @@ static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
             if (tmp->pid == req.pid && tmp->va_page == va_page) { sp = tmp; break; }
         }
 
+        if (sp && sp->corrupted) {
+            ret = -EIO; goto out_unlock;
+        }
+
         if (!sp) {
             sp = kzalloc(sizeof(struct shadow_page), GFP_KERNEL);
             if (!sp) { ret = -ENOMEM; goto out_unlock; }
@@ -268,10 +282,11 @@ static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
             sp->pid = req.pid;
             sp->va_page = va_page;
             sp->patch_count = 0;
+            sp->corrupted = false;
             is_new_sp = true;
 
-            if (force_page_resident(task, mm, va_page, &sp->orig_page) < 0) {
-                kfree(sp); ret = -EFAULT; goto out_unlock;
+            if ((ret = force_page_resident(task, mm, va_page, &sp->orig_page)) < 0) {
+                kfree(sp); goto out_unlock;
             }
 
             sp->sh_page = alloc_page(GFP_HIGHUSER);
@@ -282,11 +297,9 @@ static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
             list_add_tail(&sp->list, &shadow_page_list);
         }
 
-        // 建立事务快照
         old_count = sp->patch_count;
         memcpy(old_patches, sp->patches, sizeof(old_patches));
 
-        // 查找是否已存在同地址 Patch
         for (i = 0; i < sp->patch_count; i++) {
             if (sp->patches[i].va == req.va) {
                 sp->patches[i] = req; 
@@ -295,28 +308,19 @@ static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
         }
 
         if (!found) {
-            // 【关键修复】: 明确阻断越界静默失败
             if (sp->patch_count >= MAX_PATCHES_PER_PAGE) {
-                pr_err("[wuwa] 失败: 页内 Patch 数量超限 (%d)\n", MAX_PATCHES_PER_PAGE);
                 ret = -ENOSPC; goto err_rollback;
             }
             sp->patches[sp->patch_count++] = req;
         }
 
-        // 尝试重构影子页
-        if (rebuild_shadow_page(sp) < 0) {
-            pr_err("[wuwa] 失败: 影子页重构异常，触发事务回滚...\n");
-            ret = -ENOSPC;
-            goto err_rollback;
-        }
+        // 事务：如果重放失败，绝不往下执行 PTE 替换
+        if ((ret = rebuild_shadow_page(sp)) < 0) goto err_rollback;
 
-        // 仅在首次创建影子页时修改页表
         if (is_new_sp) {
-            if (swap_pte_with_lock(mm, va_page, page_to_pfn(sp->sh_page), &sp->orig_pfn) == 0) {
+            if ((ret = swap_pte_with_lock(mm, va_page, page_to_pfn(sp->sh_page), &sp->orig_pfn)) == 0) {
                 pr_info("[wuwa] 影子页置换成功! VA: 0x%lx\n", va_page);
             } else {
-                pr_err("[wuwa] PTE 置换失败, 回滚释放资源...\n");
-                ret = -EFAULT;
                 goto err_rollback;
             }
         }
@@ -329,14 +333,16 @@ err_rollback:
             put_page(sp->orig_page);
             kfree(sp);
         } else {
-            // 恢复旧状态并重新构建到上一个合法状态
+            // 局部失败回滚快照
             sp->patch_count = old_count;
             memcpy(sp->patches, old_patches, sizeof(old_patches));
-            rebuild_shadow_page(sp);
+            if (rebuild_shadow_page(sp) < 0) {
+                pr_emerg("[wuwa] 致命: 事务二次回滚失败！影子页 0x%lx 已损坏。\n", sp->va_page);
+                sp->corrupted = true;
+            }
         }
 
     } else {
-        // 清理逻辑 (支持按进程全清 或 局部回滚)
         list_for_each_entry_safe(sp, tmp, &shadow_page_list, list) {
             if (sp->pid == req.pid) {
                 if (req.va == 0) {
@@ -351,18 +357,18 @@ err_rollback:
                     }
                 }
 
-                if (sp->patch_count == 0) {
-                    // 【关键修复】: 进程死后不再碰页表，仅回收物理内存防泄露
-                    if (swap_pte_with_lock(mm, sp->va_page, sp->orig_pfn, NULL) == 0) {
+                if (sp->patch_count == 0 || sp->corrupted) {
+                    if ((ret = swap_pte_with_lock(mm, sp->va_page, sp->orig_pfn, NULL)) == 0) {
                         pr_info("[wuwa] 影子页已还原: 0x%lx\n", sp->va_page);
+                    } else {
+                        pr_warn("[wuwa] 警告: 还原失败 (VMA 可能已销毁), 强制回收物理页\n");
                     }
                     list_del(&sp->list);
                     __free_page(sp->sh_page);
                     put_page(sp->orig_page);
                     kfree(sp);
                 } else {
-                    rebuild_shadow_page(sp);
-                    pr_info("[wuwa] 影子页局部回滚完成 (残留 %d 个 Patch)\n", sp->patch_count);
+                    if (rebuild_shadow_page(sp) < 0) sp->corrupted = true;
                 }
             }
         }
@@ -384,7 +390,7 @@ static struct miscdevice wuwa_misc_device = {
 
 static int __init wuwa_init(void) {
     if (misc_register(&wuwa_misc_device) < 0) return -1;
-    pr_info("[wuwa] Final Engine Loaded (Transactional Shadow Manager).\n");
+    pr_info("[wuwa] Strict Shadow Manager Loaded.\n");
     return 0;
 }
 
