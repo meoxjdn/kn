@@ -7,25 +7,59 @@
 #include <linux/mm.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
-#include <linux/kprobes.h>        // 核心改动：抛弃 Ftrace，改用 Kprobes
+#include <linux/kprobes.h>
 #include <linux/miscdevice.h>
-#include <asm/debug-monitors.h>   // 包含 register_user_step_hook
-
+#include <asm/debug-monitors.h>
 #include "wuwa_ctrl.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DaNiu");
-MODULE_DESCRIPTION("Universal UXN + Single Step Stealth Hook Engine (GKI 6.6 Edition)");
+MODULE_DESCRIPTION("GKI 6.6 Stealth Symbol Hijack Engine");
 
+// ====== 动态符号表（函数指针化） ======
+typedef void (*fn_register_user_step_hook)(struct step_hook *hook);
+typedef void (*fn_unregister_user_step_hook)(struct step_hook *hook);
+typedef void (*fn_user_enable_single_step)(struct task_struct *task);
+typedef void (*fn_user_disable_single_step)(struct task_struct *task);
+
+static fn_register_user_step_hook _register_user_step_hook;
+static fn_unregister_user_step_hook _unregister_user_step_hook;
+static fn_user_enable_single_step _user_enable_single_step;
+static fn_user_disable_single_step _user_disable_single_step;
+
+// ====== 强制符号解析逻辑 (Kprobe盗取法) ======
+static void *find_hidden_symbol(const char *name) {
+    struct kprobe kp = { .symbol_name = name };
+    void *addr;
+    if (register_kprobe(&kp) < 0) {
+        pr_err("[wuwa] 无法找回隐藏符号: %s\n", name);
+        return NULL;
+    }
+    addr = (void *)kp.addr;
+    unregister_kprobe(&kp);
+    return addr;
+}
+
+static int resolve_all_symbols(void) {
+    _register_user_step_hook = (fn_register_user_step_hook)find_hidden_symbol("register_user_step_hook");
+    _unregister_user_step_hook = (fn_unregister_user_step_hook)find_hidden_symbol("unregister_user_step_hook");
+    _user_enable_single_step = (fn_user_enable_single_step)find_hidden_symbol("user_enable_single_step");
+    _user_disable_single_step = (fn_user_disable_single_step)find_hidden_symbol("user_disable_single_step");
+
+    if (!_register_user_step_hook || !_user_enable_single_step || !_user_disable_single_step || !_unregister_user_step_hook) {
+        return -ENOENT;
+    }
+    return 0;
+}
+
+// ====== 引擎全局配置 ======
 static struct patch_req active_req = {0};
 static bool engine_active = false;
 
-// ==========================================
-// 1. 底层工具：操控物理页的 UXN 权限
-// ==========================================
+// ====== 底层 PTE 操控 ======
 static void toggle_page_uxn(struct mm_struct *mm, unsigned long addr, bool enable_uxn) {
     pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep, pte;
-
+    
     pgd = pgd_offset(mm, addr);
     if (pgd_none(*pgd) || pgd_bad(*pgd)) return;
     p4d = p4d_offset(pgd, addr);
@@ -43,13 +77,13 @@ static void toggle_page_uxn(struct mm_struct *mm, unsigned long addr, bool enabl
     } else {
         pte = clear_pte_bit(pte, __pgprot(PTE_UXN));
     }
+    
+    // 使用 set_pte 规避 __mmu_notifier 导出问题
     set_pte(ptep, pte);
     flush_tlb_mm(mm);
 }
 
-// ==========================================
-// 2. 虚拟动作执行器 (寄存器魔法)
-// ==========================================
+// ====== 虚拟动作执行器 ======
 static bool apply_virtual_action(struct pt_regs *regs, struct patch_req *req) {
     uint32_t val = 0;
 
@@ -65,9 +99,9 @@ static bool apply_virtual_action(struct pt_regs *regs, struct patch_req *req) {
         case 3: /* Virtual God Mode */
             pagefault_disable();
             if (__get_user(val, (uint32_t __user *)(regs->regs[1] + 0x1C)) == 0) {
-                if (val == 0) {
-                    regs->regs[0] = 1;
-                    regs->pc = regs->regs[30];
+                if (val == 0) { // 判断为玩家
+                    regs->regs[0] = 1;         // 修改伤害
+                    regs->pc = regs->regs[30]; // RET
                     pagefault_enable();
                     return true;
                 }
@@ -80,9 +114,7 @@ static bool apply_virtual_action(struct pt_regs *regs, struct patch_req *req) {
             regs->pc = regs->regs[30];
             return true;
 
-        case 6: /* Float Ret (修复 6.6 不导出 fpsimd_save 的问题) */
-            // 异常上下文中，用户态寄存器已由硬件/底层汇编妥善托管。
-            // 只要修改当前线程绑定的 state 结构体，返回用户态时内核会自动按此恢复。
+        case 6: /* Float Ret */
             current->thread.uw.fpsimd_state.vregs[0] = (u64)req->patch_val;
             regs->pc = regs->regs[30];
             return true;
@@ -92,44 +124,32 @@ static bool apply_virtual_action(struct pt_regs *regs, struct patch_req *req) {
     }
 }
 
-// ==========================================
-// 3. 核心大招：Kprobes 接管 do_mem_abort 并 Bypass
-// ==========================================
+// ====== Kprobe 接管 do_mem_abort ======
 static int hook_do_mem_abort_pre(struct kprobe *p, struct pt_regs *regs) {
-    // ARM64 do_mem_abort(addr, esr, uregs) 对应寄存器 x0, x1, x2
     unsigned long addr = regs->regs[0];
     unsigned long esr = regs->regs[1];
     struct pt_regs *uregs = (struct pt_regs *)regs->regs[2];
-
     unsigned int ec = esr >> 26;
 
     if (engine_active && current->pid == active_req.pid && ec == 0x20) {
         unsigned long page_base = active_req.va & PAGE_MASK;
         
         if ((addr & PAGE_MASK) == page_base) {
-            
-            // 踩中精准 Hook 点，执行 Action
             if (uregs->pc == active_req.va) {
                 if (apply_virtual_action(uregs, &active_req)) {
-                    // Action 成功，需要吃掉这个异常。
-                    // 魔法：修改 PC 指向 LR（返回地址），返回 1 通知 Kprobe 取消原函数单步！
                     regs->pc = regs->regs[30]; 
-                    return 1; 
+                    return 1; // Bypass 原始 do_mem_abort
                 }
             }
 
-            // 未踩中，开启硬件单步
             toggle_page_uxn(current->mm, page_base, false);
-            user_enable_single_step(current);
+            _user_enable_single_step(current); // 动态指针调用
             
-            // 同样需要吃掉异常，防止原版 do_mem_abort 杀掉游戏进程
-            regs->pc = regs->regs[30];
-            return 1; 
+            regs->pc = regs->regs[30]; 
+            return 1; // Bypass 原始 do_mem_abort
         }
     }
-    
-    // 如果不是我们的目标进程或异常类型，返回 0 乖乖让 Kprobe 放行原函数
-    return 0; 
+    return 0; // 不是目标异常，放行
 }
 
 static struct kprobe mem_abort_kp = {
@@ -137,18 +157,15 @@ static struct kprobe mem_abort_kp = {
     .pre_handler = hook_do_mem_abort_pre,
 };
 
-// ==========================================
-// 4. 单步回收：适配 Android 15 新版 API
-// 注意修复了 esr 参数类型为 unsigned long
-// ==========================================
+// ====== 单步回收机制 ======
 static int wuwa_step_handler(struct pt_regs *regs, unsigned long esr) {
     if (engine_active && current->pid == active_req.pid) {
         unsigned long page_base = active_req.va & PAGE_MASK;
         
-        user_disable_single_step(current);
+        _user_disable_single_step(current); // 动态指针调用
         toggle_page_uxn(current->mm, page_base, true);
         
-        return 0; // DBG_HOOK_HANDLED
+        return 0; // 成功消化异常
     }
     return DBG_HOOK_ERROR;
 }
@@ -157,9 +174,7 @@ static struct step_hook my_step_hook = {
     .fn = wuwa_step_handler
 };
 
-// ==========================================
-// 控制接口与注册
-// ==========================================
+// ====== 用户态 IOCTL 接口 ======
 static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     struct patch_req req;
     struct task_struct *task;
@@ -204,35 +219,40 @@ static struct miscdevice wuwa_misc_device = {
     .fops = &wuwa_fops,
 };
 
+// ====== 模块生命周期 ======
 static int __init wuwa_engine_init(void) {
     int err;
     
+    // 1. 偷取隐藏的内核符号
+    if (resolve_all_symbols() < 0) {
+        pr_err("[wuwa] 核心符号解析失败，无法在 GKI 环境下运行！\n");
+        return -ENOSYS;
+    }
+
+    // 2. 注册设备节点
     if ((err = misc_register(&wuwa_misc_device))) return err;
 
-    // 核心修复：使用 register_user_step_hook
-    register_user_step_hook(&my_step_hook);
+    // 3. 注册单步回调
+    _register_user_step_hook(&my_step_hook);
 
-    // 核心修复：注册 Kprobe
+    // 4. 劫持异常分发
     if ((err = register_kprobe(&mem_abort_kp)) < 0) {
         pr_err("[wuwa] Kprobe 注册失败: %d\n", err);
-        unregister_user_step_hook(&my_step_hook);
+        _unregister_user_step_hook(&my_step_hook);
         misc_deregister(&wuwa_misc_device);
         return err;
     }
 
-    pr_info("[wuwa_stepper] 终极无痕硬件劫持引擎初始化成功 (Android 15 Kprobe 版)！\n");
+    pr_info("[wuwa] 幽灵引擎 (GKI 符号盗取版) 初始化成功！\n");
     return 0;
 }
 
 static void __exit wuwa_engine_exit(void) {
     engine_active = false;
-    
-    // 清理资源
     unregister_kprobe(&mem_abort_kp);
-    unregister_user_step_hook(&my_step_hook);
+    _unregister_user_step_hook(&my_step_hook);
     misc_deregister(&wuwa_misc_device);
-    
-    pr_info("[wuwa_stepper] 引擎已彻底卸载。\n");
+    pr_info("[wuwa] 幽灵引擎已卸载。\n");
 }
 
 module_init(wuwa_engine_init);
