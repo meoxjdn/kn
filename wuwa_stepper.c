@@ -196,7 +196,12 @@ static struct kprobe mem_abort_kp = {
 };
 
 // ====== 硬件单步回调 ======
-static int wuwa_step_handler(struct pt_regs *regs, unsigned long esr) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
+static int wuwa_step_handler(struct pt_regs *regs, unsigned int esr)
+#else
+static int wuwa_step_handler(struct pt_regs *regs, unsigned long esr)
+#endif
+{
     unsigned int seq;
     int retries = 0;
     struct patch_req local_req;
