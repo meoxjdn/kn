@@ -1,0 +1,31 @@
+name: Build android-wuwa kernel modules
+
+on:
+  push:
+    branches:
+      - master
+      - dev
+  pull_request:
+  # 允许手动点击按钮触发编译
+  workflow_dispatch:
+
+jobs:
+  build-modules:
+    name: Build android-wuwa.ko for ${{ matrix.kmi }}
+    # 这里引用了下面的 ddk-lkm.yml 文件
+    uses: ./.github/workflows/ddk-lkm.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi:
+          - android12-5.10
+          #- android13-5.10
+          - android13-5.15
+          #- android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+    with:
+      kmi: ${{ matrix.kmi }}
+      ddk_release: '20251016'
+      module_name: 'android-wuwa'
