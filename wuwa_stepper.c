@@ -76,18 +76,6 @@ static int resolve_all_symbols(void) {
 
     return 0;
 }
-    if (!addr_reg_step || !addr_unreg_step || !addr_en_step || !addr_dis_step) {
-        pr_err("[wuwa] 缺少外部传入的符号地址！\n");
-        return -EINVAL;
-    }
-
-    _register_user_step_hook = (fn_register_user_step_hook)addr_reg_step;
-    _unregister_user_step_hook = (fn_unregister_user_step_hook)addr_unreg_step;
-    _user_enable_single_step = (fn_user_enable_single_step)addr_en_step;
-    _user_disable_single_step = (fn_user_disable_single_step)addr_dis_step;
-
-    return 0;
-}
 
 // ====== 高并发状态机与安全信标 ======
 static struct patch_req active_req = {0};
