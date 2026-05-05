@@ -22,10 +22,10 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DaNiu");
-MODULE_DESCRIPTION("Page-Centric Shadow Manager (Solid Core - Cross Page Safe)");
+MODULE_DESCRIPTION("Page-Centric Shadow Manager (Solid Core)");
 
 #define ARM64_PTE_PFN_MASK GENMASK_ULL(47, 12)
-#define MAX_PATCHES_PER_PAGE 8
+#define MAX_PATCHES_PER_PAGE 16
 
 struct shadow_page {
     struct list_head list;
@@ -93,7 +93,7 @@ static int apply_single_patch(struct shadow_page *sp, struct patch_req *req, voi
 
     switch (req->action) {
         case 1: 
-            *dst = 0xD65F03C0; 
+            *dst = 0xD65F03C0; // RET
             break;
         case 2: 
             j_off = (long)req->target_va - (long)req->va;
@@ -126,9 +126,9 @@ static int apply_single_patch(struct shadow_page *sp, struct patch_req *req, voi
             *(dst + 1) = req->patch_val_2;
             break;
         case 5: 
-            // 【定制】：血量秒杀跨页防溢出，仅赋值 4 字节，不加 RET
+            // 【定制】：仅赋值防跨页溢出，只占 4 字节
             if (off + 4 > PAGE_SIZE) return -EFAULT;
-            *dst = 0x52800020;       // MOV W0, #1
+            *dst = 0x52800020; // MOV W0, #1
             break;
         case 6: 
             if (off + 12 > PAGE_SIZE) return -EFAULT;
@@ -171,7 +171,7 @@ static int rebuild_shadow_page(struct shadow_page *sp) {
     return ret;
 }
 
-// ====== PTE 手动置换 (带严格 VMA 校验与跨进程 TLBI) ======
+// ====== PTE 手动置换 ======
 static int swap_pte_with_lock(struct mm_struct *mm, unsigned long addr, unsigned long target_pfn, unsigned long *out_old_pfn) {
     pgd_t *pgdp; p4d_t *p4dp; pud_t *pudp; pmd_t *pmdp; pte_t *ptep;
     pte_t pte, new_pte;
@@ -232,7 +232,7 @@ err_unlock:
     return ret;
 }
 
-// ====== IOCTL 调度 (控制端下发接管) ======
+// ====== IOCTL 控制逻辑 ======
 static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     struct patch_req req;
     struct task_struct *task;
@@ -254,7 +254,6 @@ static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
 
     mm = task ? get_task_mm(task) : NULL;
 
-    // 开启操作必须有可用的 mm_struct
     if (req.enabled && !mm) {
         if (task) put_task_struct(task);
         return -ESRCH;
@@ -305,9 +304,6 @@ static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
                 goto err_rollback;
             }
             list_add_tail(&sp->list, &shadow_page_list);
-            pr_info("[wuwa] 影子页置换成功! VA: 0x%lx\n", va_page);
-        } else {
-            pr_info("[wuwa] 影子页增量更新成功! VA: 0x%llx\n", req.va);
         }
         goto out_unlock;
 
@@ -336,22 +332,11 @@ err_rollback:
 
                 if (sp->patch_count == 0 || sp->corrupted) {
                     if (mm) {
-                        if (swap_pte_with_lock(mm, sp->va_page, sp->orig_pfn, NULL) == 0) {
-                            pr_info("[wuwa] 影子页已安全还原: 0x%lx\n", sp->va_page);
-                        } else {
-                            pr_warn("[wuwa] 还原失败 (VMA 可能已改变)\n");
-                        }
-                    } else {
-                        pr_info("[wuwa] 目标进程已死亡，仅回收物理页内存: 0x%lx\n", sp->va_page);
+                        swap_pte_with_lock(mm, sp->va_page, sp->orig_pfn, NULL);
                     }
                     list_del(&sp->list); __free_page(sp->sh_page); put_page(sp->orig_page); kfree(sp);
                 } else {
-                    if (rebuild_shadow_page(sp) < 0) {
-                        pr_emerg("[wuwa] 致命: 局部清理时重构失败，影子页已损坏！\n");
-                        sp->corrupted = true;
-                    } else {
-                        pr_info("[wuwa] 局部回滚完成 (残留 %d 个 Patch)\n", sp->patch_count);
-                    }
+                    if (rebuild_shadow_page(sp) < 0) sp->corrupted = true;
                 }
             }
         }
@@ -372,9 +357,7 @@ static struct miscdevice wuwa_misc_device = {
 };
 
 static int __init wuwa_init(void) {
-    int ret = misc_register(&wuwa_misc_device);
-    if (ret == 0) pr_info("[wuwa] Solid Core Engine Started.\n");
-    return ret;
+    return misc_register(&wuwa_misc_device);
 }
 
 static void __exit wuwa_exit(void) {
@@ -401,7 +384,6 @@ static void __exit wuwa_exit(void) {
     }
     mutex_unlock(&shadow_list_lock);
     misc_deregister(&wuwa_misc_device);
-    pr_info("[wuwa] Engine Unloaded Safely.\n");
 }
 
 module_init(wuwa_init);
